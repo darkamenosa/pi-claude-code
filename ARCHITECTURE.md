@@ -22,13 +22,16 @@ credential files, refresh its tokens, or persist them. Authenticated request
 headers do pass transiently through the local turn relay described below.
 
 The provider has an ambient API-key-style auth method without a login flow. Its
-`check()` runs `claude auth status` and reports the provider as configured only
-when Claude Code is installed and logged in, so Pi hides the models otherwise.
-Requests resolve to a placeholder key. It reports Claude
-subscription logins as OAuth-shaped auth so that Pi labels list-price accounting
-as a subscription. The provider also declares an `oauth` method, marked
-`isSubscription`, only so Pi's subscription-aware UI works. Its `login()` never
-starts a flow; it tells the user to run `claude auth login`.
+`check()` only checks that the Claude Code executable exists. It does not verify
+login at startup or before a request. Claude Code authenticates the request, and
+`/claude-code-status` runs `claude auth status` when explicitly requested.
+
+Requests resolve to a placeholder key. The provider assumes a subscription and
+reports OAuth-shaped auth so Pi labels list-price accounting as a subscription.
+This label does not verify the account's billing method. The provider also
+declares an `oauth` method, marked `isSubscription`, only so Pi's
+subscription-aware UI works. Its `login()` never starts a flow; it tells the
+user to run `claude auth login`.
 
 Inherited API-key, proxy, Bedrock, Vertex, and Foundry overrides are rejected
 to avoid silently changing authentication or billing.

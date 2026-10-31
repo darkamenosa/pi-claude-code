@@ -1,5 +1,5 @@
 import { createProvider, type AuthContext, type ProviderEnv } from "@earendil-works/pi-ai";
-import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT } from "./claude-cli.ts";
+import { discoverClaudeModels, resolveClaudeExecutable } from "./claude-cli.ts";
 import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID } from "./model-catalog.ts";
 import { streamClaudeCode } from "./stream.ts";
 
@@ -41,19 +41,18 @@ export function createClaudeCodeProvider() {
     auth: {
       apiKey: {
         name: "Claude Code login",
-        // Report the external Claude Code subscription as OAuth-shaped auth so
-        // Pi can label list-price accounting as "(sub)". Requests still resolve
-        // through this ambient method; credentials remain owned by Claude Code.
+        // Claude Code owns authentication. Assume a subscription so Pi can
+        // label list-price accounting as "(sub)" without running an auth probe.
         async check({ ctx, signal }) {
+          signal.throwIfAborted();
           const providerEnv = await providerEnvironment(ctx);
           lastProviderEnv = providerEnv;
-          const status = await getClaudeStatus(claudeCodeEnv(), signal);
-          // Only report the provider as configured when Claude Code is
-          // installed and logged in, so Pi hides its models otherwise.
-          if (!status.available || !status.loggedIn) return undefined;
+          const command = await resolveClaudeExecutable(claudeCodeEnv());
+          signal.throwIfAborted();
+          if (!command) return undefined;
           return {
-            type: status.subscription ? "oauth" : "api_key",
-            source: status.subscription ? `Claude Code ${status.plan ?? "subscription"}` : "Claude Code CLI",
+            type: "oauth",
+            source: "Claude Code subscription (assumed)",
           };
         },
         async resolve({ ctx, signal }) {
@@ -80,8 +79,7 @@ export function createClaudeCodeProvider() {
           );
         },
         async refresh(_credential, signal) {
-          const status = await getClaudeStatus(claudeCodeEnv(), signal);
-          if (!status.subscription) throw new Error(LOGIN_HINT);
+          signal.throwIfAborted();
           return externalOAuthMarker();
         },
         async toAuth() {

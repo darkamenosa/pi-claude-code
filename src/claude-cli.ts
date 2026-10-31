@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -85,6 +86,7 @@ function configuredCommand(env: Record<string, string | undefined>): string {
 
 async function executable(path: string): Promise<boolean> {
   try {
+    if (!(await stat(path)).isFile()) return false;
     await access(path, process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK);
     return true;
   } catch {
@@ -178,33 +180,6 @@ export async function getClaudeStatus(
     if (signal?.aborted) throw error;
     return { available: true, loggedIn: false, subscription: false, command, detail: LOGIN_HINT };
   }
-}
-
-const READY_STATUS_TTL_MS = 60_000;
-const readyStatusCache = new Map<string, { command: string; expires: number }>();
-
-/**
- * Resolve a logged-in Claude Code executable. Successful checks are cached
- * briefly because a fresh worker is spawned after every tool call, and an
- * extra `claude auth status` process on each of those turns adds latency.
- */
-async function readyClaudeCommand(
-  envInput: Record<string, string | undefined>,
-  signal?: AbortSignal,
-): Promise<string> {
-  const env = withConfigDirectory(envInput);
-  const key = JSON.stringify([configuredCommand(env), env.PATH, env.HOME, env.CLAUDE_CONFIG_DIR]);
-  const cached = readyStatusCache.get(key);
-  if (cached && cached.expires > Date.now()) return cached.command;
-
-  const status = await getClaudeStatus(env, signal);
-  if (!status.available || !status.command) throw new Error(INSTALL_HINT);
-  if (!status.loggedIn) {
-    readyStatusCache.delete(key);
-    throw new Error(LOGIN_HINT);
-  }
-  readyStatusCache.set(key, { command: status.command, expires: Date.now() + READY_STATUS_TTL_MS });
-  return status.command;
 }
 
 function isDiscoveredModel(value: unknown): value is DiscoveredClaudeModel {
@@ -374,7 +349,7 @@ class AsyncQueue<T> {
 
   end(error?: Error): void {
     this.ended = true;
-    this.failure = error;
+    this.failure ??= error;
     for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true });
   }
 
@@ -444,23 +419,60 @@ function processEnvironment(
   return env;
 }
 
-async function writeFrame(child: ChildProcess, frame: NativeFrame): Promise<void> {
-  if (!child.stdin?.writable) throw new Error("Claude Code stdin closed during history replay");
-  if (!child.stdin.write(`${JSON.stringify(frame)}\n`)) {
-    await new Promise<void>((resolve, reject) => {
-      child.stdin!.once("drain", resolve);
-      child.stdin!.once("error", reject);
-    });
-  }
+async function writeFrame(
+  child: ChildProcess,
+  frame: NativeFrame,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const stdin = child.stdin;
+  if (!stdin?.writable) throw new Error("Claude Code stdin closed while sending a request");
+  const line = `${JSON.stringify(frame)}\n`;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stdin.off("close", onClose);
+      child.off("exit", onClose);
+      signal?.removeEventListener("abort", onAbort);
+      if (error !== undefined && error !== null) reject(error);
+      else resolve();
+    };
+    const onClose = () => finish(new Error("Claude Code stdin closed while sending a request"));
+    const onAbort = () => finish(signal?.reason ?? new Error("Claude Code request aborted"));
+    const timer = setTimeout(() => finish(new Error("Claude Code stdin write timed out")), timeoutMs);
+    stdin.once("close", onClose);
+    child.once("exit", onClose);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) return onAbort();
+    try {
+      stdin.write(line, finish);
+    } catch (error) {
+      finish(error);
+    }
+  });
 }
 
 function nativeErrorText(event: Extract<NativeOutputEvent, { type: "assistant" }>): string | undefined {
   const messageError = (event.message as Record<string, unknown>).error;
   if (!event.error && !messageError) return undefined;
-  return event.message.content
+  const text = event.message.content
     .filter((block): block is Extract<(typeof event.message.content)[number], { type: "text" }> => block.type === "text")
     .map((block) => block.text)
     .join("\n");
+  return text || (typeof event.error === "string" ? event.error : "Unknown Claude Code error");
+}
+
+function nativeResultErrorText(result: NativeResult): string {
+  const errors = Array.isArray(result.errors)
+    ? result.errors.filter((error): error is string => typeof error === "string" && error.trim().length > 0)
+    : [];
+  if (errors.length) return errors.join("\n");
+  if (typeof result.result === "string" && result.result.trim()) return result.result;
+  return result.subtype ?? "unknown result";
 }
 
 function withoutCacheControl(value: unknown): unknown {
@@ -752,7 +764,9 @@ class ClaudeProcess {
 
   static async create(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<ClaudeProcess> {
     input.signal?.throwIfAborted();
-    const command = await readyClaudeCommand({ ...process.env, ...input.env }, input.signal);
+    const command = await resolveClaudeExecutable(plan.env);
+    input.signal?.throwIfAborted();
+    if (!command) throw new Error(INSTALL_HINT);
 
     const root = await mkdtemp(join(tmpdir(), "pi-claude-code-"));
     const toolsPath = join(root, "tools.json");
@@ -815,6 +829,9 @@ class ClaudeProcess {
         stdio: ["pipe", "pipe", "pipe"],
       });
       const queue = new AsyncQueue<NativeOutputEvent>();
+      // A write callback can run before the stream emits its error event.
+      // Keep a listener even when no frame is currently being written.
+      child.stdin!.on("error", (error) => queue.end(error));
       const reader = createInterface({ input: child.stdout!, crlfDelay: Infinity });
       const readTask = (async () => {
         try {
@@ -835,6 +852,7 @@ class ClaudeProcess {
         (code) => ({ code }),
         (error: unknown) => ({ error: error instanceof Error ? error : new Error(String(error)) }),
       );
+      await once(child, "spawn", { signal: input.signal });
       return new ClaudeProcess(plan.fingerprint, root, child, relay, queue, readTask, exitOutcome, plan.timeoutMs);
     } catch (error) {
       relay?.abort();
@@ -926,14 +944,17 @@ class ClaudeProcess {
     try {
       const frames = continuation ? input.frames.slice(-1) : input.frames;
       for (const frame of frames) {
-        await writeFrame(this.child, frame);
+        await writeFrame(this.child, frame, input.signal, this.timeoutMs);
         if (frame.shouldQuery === false) {
           for (;;) {
             const event = await this.queue.next(input.signal, this.timeoutMs);
             if (!event) throw await this.exitError("Claude Code exited before acknowledging history replay");
-            if (event.type === "result") {
+            if (event.type === "assistant") {
+              const error = nativeErrorText(event);
+              if (error !== undefined) throw new Error(`Claude Code API error: ${error}`);
+            } else if (event.type === "result") {
               if (event.num_turns !== 0 || event.is_error) {
-                throw new Error("Claude Code rejected zero-turn history replay");
+                throw new Error(`Claude Code rejected zero-turn history replay: ${nativeResultErrorText(event)}`);
               }
               break;
             }
@@ -960,7 +981,10 @@ class ClaudeProcess {
       await this.relay.settled();
       input.signal?.throwIfAborted();
 
-      let message: NativeMessage | undefined;
+      const message = this.relay.used ? this.relay.capture.message : assistants.at(-1);
+      const nativeFailureHandled = this.relay.denied > 0 || message?.stop_reason === "refusal";
+      if (nativeError && !nativeFailureHandled) throw new Error(`Claude Code API error: ${nativeError}`);
+
       if (this.relay.used) {
         if (this.relay.status !== 200 || !this.relay.capture.complete || !this.relay.capture.message) {
           let detail = `status ${this.relay.status ?? "unknown"}, capture ${this.relay.capture.complete ? "complete" : "incomplete"}`;
@@ -970,24 +994,19 @@ class ClaudeProcess {
           if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
           throw new Error(`Incomplete Claude Code upstream response (${detail})`);
         }
-        message = this.relay.capture.message;
         sawMessageStop = true;
-      } else {
-        message = assistants.at(-1);
+      }
+
+      const hasTools = message?.content.some((block) => block.type === "tool_use");
+      const maxTurnsBoundary = hasTools && result?.subtype === "error_max_turns";
+      if (result && !maxTurnsBoundary && !nativeFailureHandled && (result.is_error || result.subtype !== "success")) {
+        throw new Error(`Claude Code request failed: ${nativeResultErrorText(result)}`);
       }
 
       if (!message || !sawMessageStop || !result) {
         throw new Error(
           `Incomplete Claude Code response: assistant, message_stop and one result required${this.stderr ? ` (${this.stderr.trim().slice(-500)})` : ""}`,
         );
-      }
-
-      const nativeFailureHandled = this.relay.denied > 0 || message.stop_reason === "refusal";
-      if (nativeError && !nativeFailureHandled) throw new Error(`Claude Code API error: ${nativeError}`);
-      const hasTools = message.content.some((block) => block.type === "tool_use");
-      const maxTurnsBoundary = hasTools && result.subtype === "error_max_turns";
-      if (!maxTurnsBoundary && !nativeFailureHandled && (result.is_error || result.subtype !== "success")) {
-        throw new Error(`Claude Code request failed: ${result.subtype ?? "unknown result"}`);
       }
 
       for (const block of message.content) {

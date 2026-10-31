@@ -38,7 +38,7 @@ execution. Claude Code only talks to the model. It never runs tools itself.
 ## Installation
 
 ```sh
-pi install https://github.com/earendil-works/pi-claude-code
+pi install https://github.com/darkamenosa/pi-claude-code
 ```
 
 Then pick a model from the **Claude Code Subscription (Experimental)** provider
@@ -57,6 +57,11 @@ The extension uses whatever login Claude Code currently has. You don't need
 Pi's `/login` or `/logout` for this provider. The extension doesn't read, copy,
 or store your Claude Code credentials.
 
+The extension does not check your login automatically. It assumes Claude Code
+uses a subscription and labels usage accordingly. That label does not verify
+your billing method. If Claude Code is logged out, requests will fail. If it
+uses a different billing method, charges may apply.
+
 Run `/claude-code-status` in Pi to check that Claude Code is installed and
 logged in.
 
@@ -71,9 +76,10 @@ These environment variables are optional:
 
 ## Usage and billing
 
-Requests made through this extension count against your Claude subscription's
-usage quota and rate limits, the same as any other Claude Code usage. The
-extension does not give you separate or unlimited usage.
+When Claude Code is logged in with your subscription, requests made through this
+extension count against your subscription's usage quota and rate limits, the
+same as any other Claude Code usage. The extension does not give you separate
+or unlimited usage.
 
 To avoid silently changing how you're authenticated or billed, the extension
 refuses to run if your environment sets an API key, proxy, Bedrock, Vertex, or
